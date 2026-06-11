@@ -2,5 +2,14 @@
   "buildCommand": "npm run build",
   "framework": null,
   "installCommand": "npm install",
-  "outputDirectory": ".vercel/output"
+  "routes": [
+    {
+      "src": "/cafe-bg-v2.png",
+      "dest": "/cafe-bg-v2.png"
+    },
+    {
+      "src": "/hub-bg.png",
+      "dest": "/hub-bg.png"
+    }
+  ]
 }
