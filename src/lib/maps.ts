@@ -101,7 +101,7 @@ export const MAPS: MapDef[] = [
     lightColor: 0x1a0a04, lightStrength: 0.0,
     // The bg image already contains the full café environment (floor, walls, rug,
     // bookshelves, lamps, windows, bar). Procedural decor is skipped when present.
-    bgImage: "/__l5e/assets-v1/30936699-964a-42fd-a7b3-1fc2cfd54e42/cafe-bg-v2.png",
+    bgImage: "/cafe-bg-v2.png",
     decor: [],
   },
 
@@ -144,7 +144,7 @@ export const MAPS: MapDef[] = [
     soundSuggestions: ["keyboard", "lofi", "focus"],
     weather: "neon",
     lightColor: 0x080c1a, lightStrength: 0.0,
-    bgImage: "/__l5e/assets-v1/c7053cdb-4720-4d5c-b8cf-0ed3e59187a7/hub-bg.png",
+    bgImage: "/hub-bg.png",
     decor: [],
   },
 
