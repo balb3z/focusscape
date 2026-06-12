@@ -58,14 +58,15 @@ type RoomListener = (players: SharedPlayerState[]) => void;
 
 const ACTIVE_PLAYER_WINDOW_MS = 45_000;
 const DATABASE_DOMINANCE_WINDOW_MS = 2_500;
-const MOVEMENT_BROADCAST_MS = 50; // reduced from 33ms to reduce noise
-const DATABASE_WRITE_MS = 500;    // reduced write frequency
+const MOVEMENT_BROADCAST_MS = 33;
+const DATABASE_WRITE_MS = 400;
 const PRESENCE_TRACK_MS = 15_000;
-const HEARTBEAT_MS = 8_000;       // increased from 5s
-const WATCHDOG_MS = 5_000;        // increased from 3s
-const STALE_CHANNEL_MS = 20_000;  // increased from 12s
-const RECONNECT_BASE_MS = 800;    // increased from 500
-const RECONNECT_MAX_MS = 8_000;
+const HEARTBEAT_MS = 6_000;
+const WATCHDOG_MS = 4_000;
+const STALE_CHANNEL_MS = 25_000;
+const RECONNECT_BASE_MS = 600;
+const RECONNECT_MAX_MS = 6_000;
+const GHOST_REMOVAL_DELAY_MS = 4_000;
 
 const defaultMetrics: SyncMetrics = {
   websocketStatus: "connecting",
@@ -144,7 +145,6 @@ export class SharedRoomState {
   private players = new Map<string, SharedPlayerState>();
   private listeners = new Set<RoomListener>();
   private stateVersion = 0;
-  private emitTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(public readonly roomId: string) {}
 
@@ -165,7 +165,7 @@ export class SharedRoomState {
       const nextTime = player.sentAt ?? player.lastSeen ?? 0;
       if (nextTime >= existingTime) this.players.set(player.userId, player);
     });
-    this.scheduleEmit("snapshot");
+    this.emit("snapshot");
   }
 
   upsert(player: SharedPlayerState) {
@@ -182,43 +182,30 @@ export class SharedRoomState {
       if (nextSeq === existingSeq && nextTime + 250 < existingTime) return;
     }
     this.players.set(player.userId, player);
-    this.scheduleEmit("upsert");
+    this.emit("upsert");
   }
 
   remove(userId: string) {
     if (!this.players.delete(userId)) return;
-    this.scheduleEmit("remove");
+    this.emit("remove");
   }
 
   list() {
     return [...this.players.values()].sort((a, b) => a.username.localeCompare(b.username));
   }
 
-  count() {
-    return this.players.size;
-  }
-
-  get(userId: string) {
-    return this.players.get(userId) ?? null;
-  }
-
-  version() {
-    return this.stateVersion;
-  }
-
+  count() { return this.players.size; }
+  get(userId: string) { return this.players.get(userId) ?? null; }
+  version() { return this.stateVersion; }
   activeTableCount() {
     return new Set(this.list().map((p) => p.tableId ?? p.table).filter(Boolean)).size;
   }
 
-  // Debounce emits to avoid flooding the renderer with rapid state changes
-  private scheduleEmit(reason: string) {
+  private emit(reason: string) {
     this.stateVersion += 1;
-    if (this.emitTimer) return; // already scheduled
-    this.emitTimer = setTimeout(() => {
-      this.emitTimer = null;
-      const players = this.list();
-      this.listeners.forEach((listener) => listener(players));
-    }, 50); // batch updates within 50ms window
+    const players = this.list();
+    this.listeners.forEach((l) => l(players));
+    void reason;
   }
 }
 
@@ -242,19 +229,19 @@ export class PresenceSyncService {
   private connecting = false;
   private subscribed = false;
   private reconnectAttempts = 0;
+  private recentPresenceKeys = new Map<string, number>();
   private broadcastListeners: Array<{ event: string; callback: (payload: unknown) => void }> = [];
   private metricListeners = new Set<(metrics: SyncMetrics) => void>();
   private metrics: SyncMetrics = { ...defaultMetrics };
   private packetsIn = 0;
   private packetsOut = 0;
   private pingWaitingSince: number | null = null;
+
   private readonly handleOnline = () => {
-    console.log("[mp] browser online: forcing realtime reconnect");
     this.scheduleReconnect("browser online", 0);
   };
   private readonly handleVisibility = () => {
     if (document.visibilityState === "visible") {
-      console.log("[mp] tab visible: checking realtime subscription");
       void this.resyncAuthoritativeState("tab visible");
       if (!this.subscribed) this.scheduleReconnect("tab visible", 0);
     }
@@ -272,9 +259,8 @@ export class PresenceSyncService {
 
   async join() {
     const channelName = roomChannelName(this.localPlayer.roomId);
-    console.log(`[mp] joining shared room`, { roomId: this.localPlayer.roomId, channel: channelName, userId: this.localPlayer.userId });
-
     this.updateMetrics({ websocketStatus: "connecting", lastEvent: "joining", lastEventAt: Date.now() });
+
     const staleSeenAt = new Date(Date.now() - ACTIVE_PLAYER_WINDOW_MS - 1_000).toISOString();
     await this.supabase
       .from("room_players")
@@ -293,14 +279,12 @@ export class PresenceSyncService {
     if (savedPlayer) {
       const restored = rowToSharedPlayer(savedPlayer);
       this.localPlayer = {
-        ...this.localPlayer,
-        ...restored,
+        ...this.localPlayer, ...restored,
         username: this.localPlayer.username,
         avatar_id: this.localPlayer.avatar_id,
         avatar_url: this.localPlayer.avatar_url,
         typing: false,
       };
-      console.log("[mp] restored authoritative position", this.localPlayer.userId, Math.round(this.localPlayer.x), Math.round(this.localPlayer.y));
       this.onLocalAuthoritativeState?.(this.localPlayer);
     }
 
@@ -312,6 +296,7 @@ export class PresenceSyncService {
     this.startKeepaliveTimers();
     window.addEventListener("online", this.handleOnline);
     document.addEventListener("visibilitychange", this.handleVisibility);
+    void channelName;
   }
 
   private startKeepaliveTimers() {
@@ -348,11 +333,19 @@ export class PresenceSyncService {
       if (this.leaving) return;
       const inactiveFor = Date.now() - this.lastRealtimeActivity;
       if (!this.channel || !this.subscribed) {
-        console.warn("[mp] watchdog: realtime is not subscribed", { hasChannel: !!this.channel, subscribed: this.subscribed });
         this.scheduleReconnect("watchdog unsubscribed");
       } else if (inactiveFor > STALE_CHANNEL_MS) {
-        console.warn("[mp] watchdog: realtime activity stalled", { inactiveFor });
-        this.scheduleReconnect("watchdog stale");
+        // Don't tear down a working channel just because it's been quiet —
+        // do a lightweight resync first. Only escalate to reconnect if it
+        // stays stale for much longer.
+        console.warn("[mp] channel quiet, soft resync", { inactiveFor });
+        void this.resyncAuthoritativeState("watchdog soft resync");
+        if (inactiveFor > STALE_CHANNEL_MS * 3) {
+          this.scheduleReconnect("watchdog hard stale");
+        } else {
+          // Treat the resync as activity so we don't immediately re-trigger.
+          this.lastRealtimeActivity = Date.now() - STALE_CHANNEL_MS + WATCHDOG_MS;
+        }
       }
     }, WATCHDOG_MS);
   }
@@ -366,11 +359,10 @@ export class PresenceSyncService {
       localY: Math.round(this.localPlayer.y),
       authoritativeX: Math.round(this.localPlayer.x),
       authoritativeY: Math.round(this.localPlayer.y),
-      roomStateVersion: this.roomState.version(),
-      activeTables: this.roomState.activeTableCount(),
     });
 
-    if (force || now - this.lastBroadcast >= MOVEMENT_BROADCAST_MS) {
+    const shouldBroadcast = force || (now - this.lastBroadcast >= MOVEMENT_BROADCAST_MS);
+    if (shouldBroadcast) {
       this.lastBroadcast = now;
       void this.sendPlayerEvent(force ? "PLAYER_STATE" : "PLAYER_MOVE", this.localPlayer);
     }
@@ -401,9 +393,7 @@ export class PresenceSyncService {
     return () => this.metricListeners.delete(listener);
   }
 
-  getLocalPlayer() {
-    return this.localPlayer;
-  }
+  getLocalPlayer() { return this.localPlayer; }
 
   onBroadcast(event: string, callback: (payload: unknown) => void) {
     this.broadcastListeners.push({ event, callback });
@@ -416,7 +406,6 @@ export class PresenceSyncService {
   async leave() {
     if (this.leaving) return;
     this.leaving = true;
-    console.log("[mp] leaving shared room", this.localPlayer.roomId, this.localPlayer.userId);
     if (this.heartbeat) window.clearInterval(this.heartbeat);
     if (this.metricsTimer) window.clearInterval(this.metricsTimer);
     if (this.watchdog) window.clearInterval(this.watchdog);
@@ -426,9 +415,7 @@ export class PresenceSyncService {
     await this.channel?.send({ type: "broadcast", event: "PLAYER_LEAVE", payload: { userId: this.localPlayer.userId, sentAt: Date.now() } });
     await this.channel?.untrack();
     const offlineSeenAt = new Date(Date.now() - ACTIVE_PLAYER_WINDOW_MS - 1_000).toISOString();
-    await this.supabase
-      .from("room_players")
-      .upsert(sharedPlayerToRow({ ...this.localPlayer, lastSeen: Date.now() }, offlineSeenAt), { onConflict: "user_id,room_id" });
+    await this.supabase.from("room_players").upsert(sharedPlayerToRow({ ...this.localPlayer, lastSeen: Date.now() }, offlineSeenAt), { onConflict: "user_id,room_id" });
     if (this.channel) await this.supabase.removeChannel(this.channel);
     this.channel = null;
     this.subscribed = false;
@@ -440,20 +427,16 @@ export class PresenceSyncService {
     this.subscribed = false;
     const generation = ++this.channelGeneration;
     const channelName = roomChannelName(this.localPlayer.roomId);
-    console.log(`[mp] opening realtime channel (${reason})`, { channel: channelName, attempt: this.reconnectAttempts });
     this.updateMetrics({ websocketStatus: "connecting", consistency: "syncing", lastEvent: `connect:${reason}`, lastEventAt: Date.now() });
 
     if (this.channel) {
-      const oldChannel = this.channel;
-      this.channel = null;
-      try {
-        await this.supabase.removeChannel(oldChannel);
-      } catch (error) {
-        console.warn("[mp] old channel cleanup failed", error);
-      }
+      const old = this.channel; this.channel = null;
+      try { await this.supabase.removeChannel(old); } catch { /* ignore */ }
     }
 
-    const channel = this.supabase.channel(channelName, { config: { broadcast: { self: true }, presence: { key: this.localPlayer.userId } } });
+    const channel = this.supabase.channel(channelName, {
+      config: { broadcast: { self: true, ack: false }, presence: { key: this.localPlayer.userId } },
+    });
     this.channel = channel;
 
     this.broadcastListeners.forEach(({ event, callback }) => {
@@ -468,24 +451,23 @@ export class PresenceSyncService {
       .on("presence", { event: "sync" }, () => {
         if (!this.isCurrentChannel(channel, generation)) return;
         this.markInbound("presence sync");
-        const presence = channel.presenceState();
-        console.log(`[mp] presence sync ${channelName}: ${Object.keys(presence).length} connected`, Object.keys(presence));
+        const keys = Object.keys(channel.presenceState());
+        keys.forEach((k) => this.recentPresenceKeys.set(k, Date.now()));
         this.updateMetrics({ connectedPlayers: this.roomState.count(), lastEvent: "presence sync", lastEventAt: Date.now() });
       })
-      .on("presence", { event: "join" }, ({ key, newPresences }) => {
+      .on("presence", { event: "join" }, ({ key }) => {
         if (!this.isCurrentChannel(channel, generation)) return;
         this.markInbound("presence join");
-        console.log(`[mp] presence join ${channelName}`, key, newPresences);
+        this.recentPresenceKeys.set(key, Date.now());
       })
       .on("presence", { event: "leave" }, ({ key }) => {
         if (!this.isCurrentChannel(channel, generation)) return;
         this.markInbound("presence leave");
-        console.log(`[mp] presence leave ${channelName}`, key);
-        // Delay removal slightly to avoid flicker during brief reconnects
-        setTimeout(() => {
-          if (!this.isCurrentChannel(channel, generation)) return;
-          if (key !== this.localPlayer.userId) this.roomState.remove(key);
-        }, 3000);
+        if (key === this.localPlayer.userId) return;
+        const lastSeen = this.recentPresenceKeys.get(key) ?? 0;
+        const timeSincePresence = Date.now() - lastSeen;
+        if (timeSincePresence < 1500) return;
+        this.roomState.remove(key);
       })
       .on("broadcast", { event: "PLAYER_MOVE" }, ({ payload }) => {
         if (!this.isCurrentChannel(channel, generation)) return;
@@ -509,11 +491,8 @@ export class PresenceSyncService {
       .on("broadcast", { event: "PLAYER_LEAVE" }, ({ payload }) => {
         if (!this.isCurrentChannel(channel, generation)) return;
         this.markInbound("leave");
-        // Small delay before removing to avoid flicker on reconnect
-        setTimeout(() => {
-          if (!this.isCurrentChannel(channel, generation)) return;
-          this.roomState.remove((payload as { userId: string }).userId);
-        }, 2000);
+        const { userId } = payload as { userId: string };
+        if (userId !== this.localPlayer.userId) this.roomState.remove(userId);
       })
       .on("broadcast", { event: "PING" }, ({ payload }) => {
         if (!this.isCurrentChannel(channel, generation)) return;
@@ -554,17 +533,10 @@ export class PresenceSyncService {
         this.roomState.upsert(player);
       })
       .subscribe(async (status) => {
-        if (!this.isCurrentChannel(channel, generation)) {
-          console.log(`[mp] ignored stale subscription status ${channelName}:`, status);
-          return;
-        }
+        if (!this.isCurrentChannel(channel, generation)) return;
         this.onStatus?.(status);
-        console.log(`[mp] active subscription ${channelName}:`, status);
         if (status === "SUBSCRIBED") {
-          if (this.reconnectTimer) {
-            window.clearTimeout(this.reconnectTimer);
-            this.reconnectTimer = null;
-          }
+          if (this.reconnectTimer) { window.clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
           this.connecting = false;
           this.subscribed = true;
           this.reconnectAttempts = 0;
@@ -574,13 +546,11 @@ export class PresenceSyncService {
           await this.trackPresence("subscribed", true);
           await this.sendPlayerEvent("PLAYER_JOIN", this.localPlayer);
           await this.resyncAuthoritativeState("subscribed");
-          console.log("[mp] synced users list", this.roomState.list().map((p) => p.username));
         }
         if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
           this.connecting = false;
           this.subscribed = false;
           this.updateMetrics({ websocketStatus: status.toLowerCase(), consistency: "degraded", lastEvent: status, lastEventAt: Date.now() });
-          console.error(`[mp] realtime shared room failure ${channelName}: ${status}`);
           this.scheduleReconnect(status);
         }
       });
@@ -595,16 +565,15 @@ export class PresenceSyncService {
       .gte("last_seen", cutoff);
 
     if (error) {
-      console.error(`[mp] room resync failed (${reason})`, error);
+      console.error(`[mp] resync failed (${reason})`, error);
       this.updateMetrics({ consistency: "degraded", lastEvent: "resync failed", lastEventAt: Date.now() });
       return;
     }
 
-    const snapshot = (data ?? []).map(rowToSharedPlayer).filter((player) => player.userId !== this.localPlayer.userId);
+    const snapshot = (data ?? []).map(rowToSharedPlayer).filter((p) => p.userId !== this.localPlayer.userId);
     snapshot.push(this.localPlayer);
     this.roomState.setSnapshot(snapshot);
     this.updateMetrics({ connectedPlayers: this.roomState.count(), roomStateVersion: this.roomState.version(), activeTables: this.roomState.activeTableCount(), lastEvent: `resync:${reason}`, lastEventAt: Date.now() });
-    console.log(`[mp] authoritative resync (${reason})`, snapshot.map((player) => ({ userId: player.userId, x: Math.round(player.x), y: Math.round(player.y), table: player.tableId ?? player.table })));
   }
 
   private scheduleReconnect(reason: string, explicitDelay?: number) {
@@ -612,7 +581,6 @@ export class PresenceSyncService {
     this.subscribed = false;
     const delay = explicitDelay ?? Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** this.reconnectAttempts) + Math.round(Math.random() * 250);
     this.reconnectAttempts += 1;
-    console.warn(`[mp] scheduling realtime reconnect`, { reason, delay, attempt: this.reconnectAttempts });
     this.updateMetrics({ websocketStatus: "reconnecting", consistency: "degraded", reconnectAttempts: this.reconnectAttempts, lastEvent: `reconnect:${reason}`, lastEventAt: Date.now() });
     this.reconnectTimer = window.setTimeout(async () => {
       this.reconnectTimer = null;
@@ -633,11 +601,11 @@ export class PresenceSyncService {
     this.lastPresenceTrack = now;
     try {
       const result = await this.channel.track(this.localPlayer);
-      console.log("[mp] presence track", { reason, result });
-      if (result !== "ok") this.scheduleReconnect(`presence track ${result}`);
+      // Presence tracking failures are usually transient (rate limit) and
+      // self-heal on the next heartbeat — don't tear down the channel.
+      if (result !== "ok") console.warn("[mp] presence track non-ok", { reason, result });
     } catch (error) {
-      console.error("[mp] presence track failed", error);
-      this.scheduleReconnect("presence track error");
+      console.warn("[mp] presence track failed (non-fatal)", { reason, error });
     }
   }
 
@@ -654,18 +622,25 @@ export class PresenceSyncService {
   private async sendBroadcast(event: string, payload: unknown) {
     this.packetsOut += 1;
     if (!this.channel || !this.subscribed) {
-      console.warn("[mp] dropped outbound event because realtime is disconnected", { event, subscribed: this.subscribed, hasChannel: !!this.channel });
-      if (!this.connecting) this.scheduleReconnect(`send while disconnected:${event}`, 0);
+      // Only escalate to a reconnect for non-movement events; movement is
+      // sent at high frequency and the channel will recover on its own.
+      if (!this.connecting && event !== "PLAYER_MOVE" && event !== "PING" && event !== "PONG") {
+        this.scheduleReconnect(`send while disconnected:${event}`, 0);
+      }
       return;
     }
     try {
       const result = await this.channel.send({ type: "broadcast", event, payload });
-      if (event !== "PLAYER_MOVE") console.log("[mp] outbound event", { event, result });
-      else if (result !== "ok") console.warn("[mp] outbound movement failed", { result });
-      if (result !== "ok") this.scheduleReconnect(`send ${event} ${result}`);
+      // A single failed send (e.g. transient rate limit) should not tear down
+      // the whole channel — only escalate for important, low-frequency events.
+      if (result !== "ok" && event !== "PLAYER_MOVE" && event !== "PING" && event !== "PONG") {
+        this.scheduleReconnect(`send ${event} ${result}`);
+      }
     } catch (error) {
-      console.error("[mp] outbound event failed", { event, error });
-      this.scheduleReconnect(`send ${event} error`);
+      if (event !== "PLAYER_MOVE" && event !== "PING" && event !== "PONG") {
+        console.error("[mp] outbound event failed", { event, error });
+        this.scheduleReconnect(`send ${event} error`);
+      }
     }
   }
 
@@ -683,7 +658,7 @@ export class PresenceSyncService {
 
   private updateMetrics(next: Partial<SyncMetrics>) {
     this.metrics = { ...this.metrics, ...next };
-    this.metricListeners.forEach((listener) => listener(this.metrics));
+    this.metricListeners.forEach((l) => l(this.metrics));
   }
 }
 
@@ -699,24 +674,29 @@ export class MovementInterpolator {
   }
 }
 
+type RemoteEntry = {
+  container: Phaser.GameObjects.Container;
+  body: Phaser.GameObjects.Rectangle;
+  nameText: Phaser.GameObjects.Text;
+  avatarUrl?: string | null;
+  avatarImg?: Phaser.GameObjects.Image;
+  bubble?: Phaser.GameObjects.Container;
+  currentX: number;
+  currentY: number;
+  targetX: number;
+  targetY: number;
+  vx: number;
+  vy: number;
+  lastUpdateMs: number;
+  sentAtMs: number;
+  animationState: PlayerAnimationState;
+  focusStatus: PlayerFocusStatus;
+  typing: boolean;
+  ghostSince: number | null;
+};
+
 export class RemotePlayerManager {
-  private others = new Map<string, {
-    container: Phaser.GameObjects.Container;
-    body: Phaser.GameObjects.Rectangle;
-    nameText: Phaser.GameObjects.Text;
-    avatarUrl?: string | null;
-    avatarImg?: Phaser.GameObjects.Image;
-    bubble?: Phaser.GameObjects.Container;
-    targetX: number;
-    targetY: number;
-    vx: number;
-    vy: number;
-    lastUpdate: number;
-    animationState: PlayerAnimationState;
-    focusStatus: PlayerFocusStatus;
-    typing: boolean;
-    pendingRemoval?: ReturnType<typeof setTimeout>;
-  }>();
+  private others = new Map<string, RemoteEntry>();
 
   constructor(
     private readonly scene: Phaser.Scene,
@@ -727,90 +707,95 @@ export class RemotePlayerManager {
   ) {}
 
   render(players: SharedPlayerState[]) {
-    const activeRemoteIds = new Set(players.filter((player) => player.userId !== this.localUserId).map((player) => player.userId));
+    const activeIds = new Set(
+      players.filter((p) => p.userId !== this.localUserId).map((p) => p.userId),
+    );
 
-    // Update/create players that are present
-    players.forEach((player) => {
-      if (player.userId !== this.localUserId) this.upsert(player);
+    players.forEach((p) => {
+      if (p.userId !== this.localUserId) this.upsert(p);
     });
 
-    // Gracefully remove players no longer in the list
-    for (const [id, remote] of this.others.entries()) {
-      if (!activeRemoteIds.has(id)) {
-        // Cancel any existing pending removal
-        if (remote.pendingRemoval) clearTimeout(remote.pendingRemoval);
-        // Fade out then destroy instead of instant removal
-        remote.pendingRemoval = setTimeout(() => {
-          if (this.others.has(id)) {
-            remote.container.destroy();
-            remote.bubble?.destroy();
-            this.others.delete(id);
-          }
-        }, 2500);
-        // Fade out visually
+    for (const [id, entry] of this.others) {
+      if (!activeIds.has(id) && entry.ghostSince === null) {
+        entry.ghostSince = Date.now();
         this.scene.tweens.add({
-          targets: remote.container,
+          targets: entry.container,
           alpha: 0,
-          duration: 800,
+          duration: Math.min(GHOST_REMOVAL_DELAY_MS * 0.7, 1200),
           ease: "Power2",
         });
-      } else if (remote.pendingRemoval) {
-        // Player came back — cancel the removal and restore alpha
-        clearTimeout(remote.pendingRemoval);
-        remote.pendingRemoval = undefined;
-        this.scene.tweens.add({
-          targets: remote.container,
-          alpha: 1,
-          duration: 300,
-        });
+      } else if (activeIds.has(id) && entry.ghostSince !== null) {
+        entry.ghostSince = null;
+        this.scene.tweens.killTweensOf(entry.container);
+        this.scene.tweens.add({ targets: entry.container, alpha: 1, duration: 250 });
       }
     }
   }
 
   update(dtMs: number) {
-    const dt = Math.min(dtMs / 1000, 0.05);
     const now = Date.now();
-    this.others.forEach((remote) => {
-      const age = Math.min((now - remote.lastUpdate) / 1000, 0.25);
-      const predictedX = remote.targetX + remote.vx * age;
-      const predictedY = remote.targetY + remote.vy * age;
-      const alpha = remote.animationState === "focused" || remote.focusStatus === "focused" ? 0.8 : Math.min(1, dt * 18);
-      remote.container.x = MovementInterpolator.step(remote.container.x, predictedX, dtMs, alpha * 60);
-      remote.container.y = MovementInterpolator.step(remote.container.y, predictedY, dtMs, alpha * 60);
-    });
+
+    for (const [id, entry] of this.others) {
+      if (entry.ghostSince !== null && now - entry.ghostSince > GHOST_REMOVAL_DELAY_MS) {
+        entry.container.destroy();
+        entry.bubble?.destroy();
+        this.others.delete(id);
+        continue;
+      }
+
+      const isSeated = entry.animationState === "focused" || entry.focusStatus === "focused";
+
+      if (isSeated) {
+        // Smooth glide into the seat.
+        entry.currentX = MovementInterpolator.step(entry.currentX, entry.targetX, dtMs, 14);
+        entry.currentY = MovementInterpolator.step(entry.currentY, entry.targetY, dtMs, 14);
+      } else {
+        // Dead-reckoning: extrapolate from the last known velocity for up to
+        // 180ms (longer than that and velocity is probably stale/zero).
+        const ageSec = Math.min((now - entry.sentAtMs) / 1000, 0.18);
+        const predictedX = entry.targetX + entry.vx * ageSec;
+        const predictedY = entry.targetY + entry.vy * ageSec;
+
+        // Adaptive speed: snap faster when far away (catch up quickly),
+        // glide smoothly when close (avoid jitter on tiny corrections).
+        const dist = Math.hypot(predictedX - entry.currentX, predictedY - entry.currentY);
+        const speed = dist > 60 ? 30 : dist > 12 ? 22 : 14;
+
+        entry.currentX = MovementInterpolator.step(entry.currentX, predictedX, dtMs, speed);
+        entry.currentY = MovementInterpolator.step(entry.currentY, predictedY, dtMs, speed);
+      }
+
+      entry.container.x = entry.currentX;
+      entry.container.y = entry.currentY;
+    }
   }
 
-  getContainer(userId: string) {
-    return this.others.get(userId)?.container;
-  }
+  getContainer(userId: string) { return this.others.get(userId)?.container; }
 
   showBubble(userId: string, text: string) {
-    const target = this.getContainer(userId);
-    if (target) this.showBubbleOn(target, text);
+    const t = this.getContainer(userId);
+    if (t) this.showBubbleOn(t, text);
   }
 
   destroy() {
-    this.others.forEach((remote) => {
-      if (remote.pendingRemoval) clearTimeout(remote.pendingRemoval);
-      remote.container.destroy();
-    });
+    this.others.forEach((e) => e.container.destroy());
     this.others.clear();
   }
 
   private upsert(player: SharedPlayerState) {
-    const colors = AVATAR_COLORS[player.avatar_id] ?? AVATAR_COLORS[0];
     const style = getCharacterStyle(player.gender ?? "male");
-    void colors;
-    let remote = this.others.get(player.userId);
-    if (!remote) {
+    const nowMs = Date.now();
+    let entry = this.others.get(player.userId);
+
+    if (!entry) {
       const container = this.scene.add.container(player.x, player.y).setDepth(9).setAlpha(0);
-      const shadow = this.scene.add.ellipse(0, 18, 28, 8, 0x000000, 0.35);
-      const legL = this.scene.add.rectangle(-5, 14, 7, 14, style.pants).setStrokeStyle(1, 0x000000, 0.3);
-      const legR = this.scene.add.rectangle(5, 14, 7, 14, style.pants).setStrokeStyle(1, 0x000000, 0.3);
-      const body = this.scene.add.rectangle(0, 0, 22, 26, style.shirt).setStrokeStyle(2, 0x000000, 0.35);
-      const armL = this.scene.add.rectangle(-13, 0, 5, 18, style.shirt).setStrokeStyle(1, 0x000000, 0.3);
-      const armR = this.scene.add.rectangle(13, 0, 5, 18, style.shirt).setStrokeStyle(1, 0x000000, 0.3);
-      const head = this.scene.add.circle(0, -16, 9, style.skin).setStrokeStyle(2, 0x000000, 0.35);
+      const shadow  = this.scene.add.ellipse(0, 18, 28, 8, 0x000000, 0.35);
+      const legL    = this.scene.add.rectangle(-5, 14, 7, 14, style.pants).setStrokeStyle(1, 0x000000, 0.3);
+      const legR    = this.scene.add.rectangle(5, 14, 7, 14, style.pants).setStrokeStyle(1, 0x000000, 0.3);
+      const body    = this.scene.add.rectangle(0, 0, 22, 26, style.shirt).setStrokeStyle(2, 0x000000, 0.35);
+      const armL    = this.scene.add.rectangle(-13, 0, 5, 18, style.shirt).setStrokeStyle(1, 0x000000, 0.3);
+      const armR    = this.scene.add.rectangle(13, 0, 5, 18, style.shirt).setStrokeStyle(1, 0x000000, 0.3);
+      const head    = this.scene.add.circle(0, -16, 9, style.skin).setStrokeStyle(2, 0x000000, 0.35);
       const hairTop = this.scene.add.ellipse(0, -22, 18, 8, style.hair);
       const hairExtras: Phaser.GameObjects.GameObject[] = [hairTop];
       if (style.hairStyle === "long") {
@@ -820,64 +805,82 @@ export class RemotePlayerManager {
       const eyeL = this.scene.add.circle(-3, -17, 1.1, 0x111111);
       const eyeR = this.scene.add.circle(3, -17, 1.1, 0x111111);
       const ring = this.scene.add.circle(0, -52, 18, this.map.accent, 0.0).setStrokeStyle(2, this.map.accent, 0.9);
-      const nameText = this.scene.add.text(0, -76, player.username, { fontFamily: "monospace", fontSize: "12px", color: "#ffffff", backgroundColor: "#00000099", padding: { x: 4, y: 2 } }).setOrigin(0.5);
+      const nameText = this.scene.add.text(0, -76, player.username, {
+        fontFamily: "monospace", fontSize: "12px", color: "#ffffff",
+        backgroundColor: "#00000099", padding: { x: 4, y: 2 },
+      }).setOrigin(0.5);
       container.add([shadow, legL, legR, body, armL, armR, head, ...hairExtras, eyeL, eyeR, ring, nameText]);
       this.scene.tweens.add({ targets: body, scaleY: 1.04, duration: 1700 + Math.random() * 600, yoyo: true, repeat: -1, ease: "Sine.easeInOut" });
-      // Fade in smoothly
-      this.scene.tweens.add({ targets: container, alpha: 1, duration: 400, ease: "Power2" });
-      remote = { container, body, nameText, avatarUrl: player.avatar_url ?? null, targetX: player.x, targetY: player.y, vx: player.vx ?? 0, vy: player.vy ?? 0, lastUpdate: player.sentAt ?? Date.now(), animationState: player.animationState, focusStatus: player.focusStatus, typing: !!player.typing };
-      this.others.set(player.userId, remote);
+      this.scene.tweens.add({ targets: container, alpha: 1, duration: 350, ease: "Power2" });
+
+      entry = {
+        container, body, nameText,
+        avatarUrl: player.avatar_url ?? null,
+        currentX: player.x, currentY: player.y,
+        targetX: player.x, targetY: player.y,
+        vx: player.vx ?? 0, vy: player.vy ?? 0,
+        lastUpdateMs: nowMs,
+        sentAtMs: player.sentAt ?? nowMs,
+        animationState: player.animationState,
+        focusStatus: player.focusStatus,
+        typing: !!player.typing,
+        ghostSince: null,
+      };
+      this.others.set(player.userId, entry);
       if (player.avatar_url) this.attachAvatar(player.userId, player.avatar_url);
     } else {
-      // Cancel pending removal if player is still active
-      if (remote.pendingRemoval) {
-        clearTimeout(remote.pendingRemoval);
-        remote.pendingRemoval = undefined;
-        this.scene.tweens.add({ targets: remote.container, alpha: 1, duration: 300 });
+      if (entry.ghostSince !== null) {
+        entry.ghostSince = null;
+        this.scene.tweens.killTweensOf(entry.container);
+        this.scene.tweens.add({ targets: entry.container, alpha: 1, duration: 250 });
       }
-      remote.nameText.setText(`${player.username}${player.typing ? " …" : ""}`);
-      const seated = player.animationState === "focused" || player.focusStatus === "focused";
-      if (!seated) {
-        remote.targetX = player.x;
-        remote.targetY = player.y;
-        remote.vx = player.vx ?? 0;
-        remote.vy = player.vy ?? 0;
-      } else {
-        remote.targetX = player.x;
-        remote.targetY = player.y;
-        remote.vx = 0;
-        remote.vy = 0;
+
+      entry.nameText.setText(`${player.username}${player.typing ? " …" : ""}`);
+
+      const isSeated = player.animationState === "focused" || player.focusStatus === "focused";
+      entry.targetX = player.x;
+      entry.targetY = player.y;
+      entry.vx = isSeated ? 0 : (player.vx ?? 0);
+      entry.vy = isSeated ? 0 : (player.vy ?? 0);
+      entry.lastUpdateMs = nowMs;
+      entry.sentAtMs = player.sentAt ?? nowMs;
+      entry.animationState = player.animationState;
+      entry.focusStatus = player.focusStatus;
+      entry.typing = !!player.typing;
+
+      const dist = Math.hypot(entry.currentX - player.x, entry.currentY - player.y);
+      if (dist > 400) {
+        entry.currentX = player.x;
+        entry.currentY = player.y;
       }
-      remote.lastUpdate = player.sentAt ?? Date.now();
-      remote.animationState = player.animationState;
-      remote.focusStatus = player.focusStatus;
-      remote.typing = !!player.typing;
-      if (seated) remote.container.setPosition(player.x, player.y);
-      if (player.avatar_url && player.avatar_url !== remote.avatarUrl) {
-        remote.avatarUrl = player.avatar_url;
+
+      if (player.avatar_url && player.avatar_url !== entry.avatarUrl) {
+        entry.avatarUrl = player.avatar_url;
         this.attachAvatar(player.userId, player.avatar_url);
       }
     }
-    remote.container.setAlpha(player.focusStatus === "focused" || player.animationState === "focused" ? 0.9 : 1);
-    remote.body.scaleY = player.animationState === "walking" ? 1.08 : 1;
+
+    const seated = entry.animationState === "focused" || entry.focusStatus === "focused";
+    entry.container.setAlpha(seated ? 0.9 : 1);
+    entry.body.scaleY = entry.animationState === "walking" ? 1.08 : 1;
   }
 
   private attachAvatar(userId: string, url: string) {
     this.loadAvatar(url, (key) => {
-      const remote = this.others.get(userId);
-      if (!remote) return;
-      if (remote.avatarImg) remote.avatarImg.destroy();
+      const entry = this.others.get(userId);
+      if (!entry) return;
+      if (entry.avatarImg) entry.avatarImg.destroy();
       const img = this.scene.add.image(0, -52, key).setDisplaySize(30, 30);
       const mask = this.scene.add.graphics().fillCircle(0, -52, 14).setVisible(false);
       img.setMask(new this.PhaserLib.Display.Masks.GeometryMask(this.scene, mask));
-      remote.container.add([mask, img]);
-      remote.avatarImg = img;
+      entry.container.add([mask, img]);
+      entry.avatarImg = img;
     });
   }
 
   private showBubbleOn(target: Phaser.GameObjects.Container, text: string) {
     const trimmed = text.slice(0, 80);
-    const bg = this.scene.add.rectangle(0, -100, Math.min(160, trimmed.length * 8 + 16), 22, 0xffffff, 0.95).setStrokeStyle(2, 0x000000, 0.2);
+    const bg  = this.scene.add.rectangle(0, -100, Math.min(160, trimmed.length * 8 + 16), 22, 0xffffff, 0.95).setStrokeStyle(2, 0x000000, 0.2);
     const txt = this.scene.add.text(0, -100, trimmed, { fontFamily: "monospace", fontSize: "11px", color: "#222" }).setOrigin(0.5);
     const bubble = this.scene.add.container(0, 0, [bg, txt]).setDepth(20);
     target.add(bubble);
