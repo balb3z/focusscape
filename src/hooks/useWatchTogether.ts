@@ -24,7 +24,7 @@ export type WatchSession = {
   video_url: string;
   video_id: string;
   is_playing: boolean;
-  current_time: number;
+  current_seconds: number;
   updated_at: string;
 };
 
@@ -175,8 +175,8 @@ export function useWatchTogether({
     applyingRemote.current = true;
     try {
       const currentTime = player.getCurrentTime();
-      if (Math.abs(currentTime - s.current_time) > SYNC_TOLERANCE_S) {
-        player.seekTo(s.current_time, true);
+      if (Math.abs(currentTime - s.current_seconds) > SYNC_TOLERANCE_S) {
+        player.seekTo(s.current_seconds, true);
       }
       if (s.is_playing) {
         player.playVideo();
@@ -197,7 +197,7 @@ export function useWatchTogether({
       video_url: "",
       video_id: "",
       is_playing: false,
-      current_time: 0,
+      current_seconds: 0,
       updated_at: new Date().toISOString(),
     };
     const next = { ...base, ...patch, updated_at: new Date().toISOString() };
@@ -212,26 +212,26 @@ export function useWatchTogether({
   const setVideoUrl = useCallback(async (url: string) => {
     if (!isHost) return;
     const videoId = extractYouTubeId(url);
-    await upsertSession({ video_url: url, video_id: videoId, is_playing: false, current_time: 0 });
+    await upsertSession({ video_url: url, video_id: videoId, is_playing: false, current_seconds: 0 });
   }, [isHost, tableId, userId, session]);
 
   const play = useCallback(async () => {
     if (!isHost || !playerRef.current) return;
     const currentTime = playerRef.current.getCurrentTime();
-    await upsertSession({ is_playing: true, current_time: currentTime });
+    await upsertSession({ is_playing: true, current_seconds: currentTime });
     playerRef.current.playVideo();
   }, [isHost, tableId, userId, session]);
 
   const pause = useCallback(async () => {
     if (!isHost || !playerRef.current) return;
     const currentTime = playerRef.current.getCurrentTime();
-    await upsertSession({ is_playing: false, current_time: currentTime });
+    await upsertSession({ is_playing: false, current_seconds: currentTime });
     playerRef.current.pauseVideo();
   }, [isHost, tableId, userId, session]);
 
   const seek = useCallback(async (seconds: number) => {
     if (!isHost || !playerRef.current) return;
-    await upsertSession({ current_time: seconds });
+    await upsertSession({ current_seconds: seconds });
     playerRef.current.seekTo(seconds, true);
   }, [isHost, tableId, userId, session]);
 

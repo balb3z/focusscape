@@ -9,7 +9,7 @@ CREATE TABLE public.watch_together_sessions (
   video_url   TEXT        NOT NULL DEFAULT '',
   video_id    TEXT        NOT NULL DEFAULT '',
   is_playing  BOOLEAN     NOT NULL DEFAULT false,
-  current_time DOUBLE PRECISION NOT NULL DEFAULT 0,
+  current_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

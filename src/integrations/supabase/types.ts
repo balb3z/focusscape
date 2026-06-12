@@ -142,7 +142,7 @@ export type Database = {
           video_url: string
           video_id: string
           is_playing: boolean
-          current_time: number
+          current_seconds: number
           updated_at: string
         }
         Insert: {
@@ -152,7 +152,7 @@ export type Database = {
           video_url?: string
           video_id?: string
           is_playing?: boolean
-          current_time?: number
+          current_seconds?: number
           updated_at?: string
         }
         Update: {
@@ -162,7 +162,7 @@ export type Database = {
           video_url?: string
           video_id?: string
           is_playing?: boolean
-          current_time?: number
+          current_seconds?: number
           updated_at?: string
         }
         Relationships: []
