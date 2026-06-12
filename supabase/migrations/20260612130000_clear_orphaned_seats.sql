@@ -21,7 +21,7 @@ BEGIN
       seat_index = NULL,
       animation_state = 'idle',
       focus_status = 'idle'
-  WHERE table_id = OLD.id;
+  WHERE table_id = OLD.id::text;
 
   RETURN OLD;
 END;
@@ -42,5 +42,5 @@ SET table_id = NULL,
     focus_status = 'idle'
 WHERE rp.table_id IS NOT NULL
   AND NOT EXISTS (
-    SELECT 1 FROM public.room_tables rt WHERE rt.id = rp.table_id
+    SELECT 1 FROM public.room_tables rt WHERE rt.id::text = rp.table_id
   );

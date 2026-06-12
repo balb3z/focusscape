@@ -15,7 +15,7 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
 DECLARE
-  affected_table_id uuid;
+  affected_table_id text;
   remaining_occupants integer;
 BEGIN
   -- Determine which table_id (if any) might have just lost its last occupant.
@@ -48,7 +48,7 @@ BEGIN
     AND last_seen > now() - interval '45 seconds';
 
   IF remaining_occupants = 0 THEN
-    DELETE FROM public.room_tables WHERE id = affected_table_id;
+    DELETE FROM public.room_tables WHERE id::text = affected_table_id;
   END IF;
 
   RETURN COALESCE(NEW, OLD);
@@ -76,7 +76,7 @@ BEGIN
   WHERE rt.room_id = p_room_id
     AND NOT EXISTS (
       SELECT 1 FROM public.room_players rp
-      WHERE rp.table_id = rt.id
+      WHERE rp.table_id = rt.id::text
         AND rp.seat_index IS NOT NULL
         AND rp.last_seen > now() - interval '45 seconds'
     );
