@@ -148,7 +148,7 @@ const sharedPlayerToRow = (player: SharedPlayerState, lastSeen = new Date(player
   focus_status: player.focusStatus,
   last_seen: lastSeen,
   ...({ gender: player.gender ?? "male" } as Record<string, string>),
-  ...(player.character_config ? { character_config: player.character_config as unknown as Record<string, unknown> } : {}),
+  character_config: (player.character_config ?? null) as unknown as Record<string, unknown> | null,
 });
 
 export class SharedRoomState {
@@ -574,7 +574,27 @@ export class PresenceSyncService {
           this.updateMetrics({ authoritativeX: Math.round(player.x), authoritativeY: Math.round(player.y) });
           return;
         }
-        this.roomState.upsert(player);
+        // Enrich with profile data if character_config is missing from the row
+        if (!player.character_config) {
+          void this.supabase
+            .from("profiles")
+            .select("gender, character_config")
+            .eq("id", player.userId)
+            .maybeSingle()
+            .then(({ data: prof }) => {
+              if (prof) {
+                this.roomState.upsert({
+                  ...player,
+                  gender: (prof.gender === "female" ? "female" : "male") as "male" | "female",
+                  character_config: (prof.character_config as unknown as CharacterConfig | null) ?? null,
+                });
+              } else {
+                this.roomState.upsert(player);
+              }
+            });
+        } else {
+          this.roomState.upsert(player);
+        }
       })
       .subscribe(async (status) => {
         if (!this.isCurrentChannel(channel, generation)) return;
@@ -602,19 +622,45 @@ export class PresenceSyncService {
 
   private async resyncAuthoritativeState(reason: string) {
     const cutoff = new Date(Date.now() - ACTIVE_PLAYER_WINDOW_MS).toISOString();
+    // Join profiles to get character_config + gender from the authoritative source.
+    // room_players.gender/character_config may lag or be null for older rows.
     const { data, error } = await this.supabase
       .from("room_players")
-      .select("*")
+      .select("*, profiles!inner(gender, character_config)")
       .eq("room_id", this.localPlayer.roomId)
       .gte("last_seen", cutoff);
 
     if (error) {
-      console.error(`[mp] resync failed (${reason})`, error);
-      this.updateMetrics({ consistency: "degraded", lastEvent: "resync failed", lastEventAt: Date.now() });
+      // Fall back to plain select if join fails (e.g. RLS edge case)
+      console.warn(`[mp] resync with join failed (${reason}), falling back:`, error.message);
+      const { data: plain, error: plainErr } = await this.supabase
+        .from("room_players")
+        .select("*")
+        .eq("room_id", this.localPlayer.roomId)
+        .gte("last_seen", cutoff);
+      if (plainErr) {
+        console.error(`[mp] resync failed (${reason})`, plainErr);
+        this.updateMetrics({ consistency: "degraded", lastEvent: "resync failed", lastEventAt: Date.now() });
+        return;
+      }
+      const snapshot = (plain ?? []).map(rowToSharedPlayer).filter((p) => p.userId !== this.localPlayer.userId);
+      snapshot.push(this.localPlayer);
+      this.roomState.setSnapshot(snapshot);
+      this.updateMetrics({ connectedPlayers: this.roomState.count(), roomStateVersion: this.roomState.version(), activeTables: this.roomState.activeTableCount(), lastEvent: `resync:${reason}`, lastEventAt: Date.now() });
       return;
     }
 
-    const snapshot = (data ?? []).map(rowToSharedPlayer).filter((p) => p.userId !== this.localPlayer.userId);
+    // Merge profile data into each row before mapping
+    const enriched = (data ?? []).map((row) => {
+      const prof = (row as unknown as { profiles?: { gender?: string; character_config?: CharacterConfig | null } }).profiles;
+      return {
+        ...row,
+        gender: prof?.gender ?? row.gender ?? "male",
+        character_config: prof?.character_config ?? (row as unknown as { character_config?: CharacterConfig | null }).character_config ?? null,
+      };
+    });
+
+    const snapshot = enriched.map(rowToSharedPlayer).filter((p) => p.userId !== this.localPlayer.userId);
     snapshot.push(this.localPlayer);
     this.roomState.setSnapshot(snapshot);
     this.updateMetrics({ connectedPlayers: this.roomState.count(), roomStateVersion: this.roomState.version(), activeTables: this.roomState.activeTableCount(), lastEvent: `resync:${reason}`, lastEventAt: Date.now() });
@@ -738,6 +784,8 @@ type RemoteEntry = {
   typing: boolean;
   ghostSince: number | null;
   lastSeenInListMs: number;
+  /** Serialized character config — used to detect when we need to rebuild the sprite. */
+  characterConfigKey: string;
 };
 
 export class RemotePlayerManager {
@@ -839,8 +887,23 @@ export class RemotePlayerManager {
 
   private upsert(player: SharedPlayerState) {
     const style = getCharacterStyle(player.gender ?? "male", player.character_config ?? null);
+    const newConfigKey = `${player.gender ?? "male"}:${JSON.stringify(player.character_config ?? null)}`;
     const nowMs = Date.now();
     let entry = this.others.get(player.userId);
+
+    // If the player already exists but their character config has changed (e.g.
+    // config arrived late from the profile join), destroy the old sprite and
+    // rebuild it so the correct colours appear.
+    if (entry && entry.characterConfigKey !== newConfigKey) {
+      const savedX = entry.currentX;
+      const savedY = entry.currentY;
+      entry.container.destroy();
+      entry.bubble?.destroy();
+      this.others.delete(player.userId);
+      entry = undefined;
+      // Re-enter with the correct position so the new sprite appears in place
+      player = { ...player, x: savedX, y: savedY };
+    }
 
     if (!entry) {
       const container = this.scene.add.container(player.x, player.y).setDepth(9).setAlpha(0);
@@ -901,6 +964,7 @@ export class RemotePlayerManager {
         typing: !!player.typing,
         ghostSince: null,
         lastSeenInListMs: nowMs,
+        characterConfigKey: newConfigKey,
       };
       this.others.set(player.userId, entry);
       if (player.avatar_url) this.attachAvatar(player.userId, player.avatar_url);
