@@ -351,7 +351,7 @@ export function GameHud({
 
       {/* ── WATCH TOGETHER ── */}
       {tableInfo && myUserId && (
-        <div className="pointer-events-auto absolute left-4 z-20" style={{ top: "calc(5rem + 22rem)" }}>
+        <div className="pointer-events-auto absolute left-4 z-20" style={{ top: "calc(5rem + 14rem)" }}>
           <WatchTogetherPanel
             tableId={tableInfo.tableId}
             roomId={map.id}
