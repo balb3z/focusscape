@@ -64,9 +64,16 @@ const PRESENCE_TRACK_MS = 15_000;
 const HEARTBEAT_MS = 6_000;
 const WATCHDOG_MS = 4_000;
 const STALE_CHANNEL_MS = 25_000;
+// How often to do a full DB resync to catch players whose departure wasn't
+// announced via a clean PLAYER_LEAVE (closed tab, crash, lost connection).
+const PERIODIC_RESYNC_MS = 8_000;
 const RECONNECT_BASE_MS = 600;
 const RECONNECT_MAX_MS = 6_000;
 const GHOST_REMOVAL_DELAY_MS = 4_000;
+// A player can be momentarily missing from a snapshot (resync race, brief
+// network hiccup) without actually having left. Only start fading them out
+// after they've been absent from the player list for this long.
+const ABSENCE_GRACE_MS = 3_000;
 
 const defaultMetrics: SyncMetrics = {
   websocketStatus: "connecting",
@@ -145,11 +152,6 @@ export class SharedRoomState {
   private players = new Map<string, SharedPlayerState>();
   private listeners = new Set<RoomListener>();
   private stateVersion = 0;
-  // Debounce: coalesce rapid upserts (movement packets at 30fps) into a
-  // single render call per animation frame.  Without this, render() fires
-  // 30+ times per second — enough to trigger ghost flicker on every packet.
-  private emitScheduled = false;
-  private lastEmitReason = "boot";
 
   constructor(public readonly roomId: string) {}
 
@@ -160,6 +162,8 @@ export class SharedRoomState {
   }
 
   setSnapshot(players: SharedPlayerState[]) {
+    const incomingIds = new Set(players.map((p) => p.userId));
+
     players.forEach((player) => {
       const existing = this.players.get(player.userId);
       if (!existing) {
@@ -170,6 +174,15 @@ export class SharedRoomState {
       const nextTime = player.sentAt ?? player.lastSeen ?? 0;
       if (nextTime >= existingTime) this.players.set(player.userId, player);
     });
+
+    // The snapshot is the authoritative active-player list from the DB
+    // (filtered by ACTIVE_PLAYER_WINDOW_MS). Anyone we're tracking but who
+    // is missing from it has gone stale/offline — remove them so they don't
+    // linger in the UI until an unrelated update happens to clear them.
+    for (const userId of [...this.players.keys()]) {
+      if (!incomingIds.has(userId)) this.players.delete(userId);
+    }
+
     this.emit("snapshot");
   }
 
@@ -208,25 +221,9 @@ export class SharedRoomState {
 
   private emit(reason: string) {
     this.stateVersion += 1;
-    this.lastEmitReason = reason;
-    // Structural changes (join/leave/snapshot) must fire immediately so the
-    // ghost system reacts without a frame of delay.
-    const urgent = reason === "remove" || reason === "snapshot";
-    if (urgent) {
-      this.emitScheduled = false;
-      const players = this.list();
-      this.listeners.forEach((l) => l(players));
-      return;
-    }
-    // Movement upserts: coalesce into one call per animation frame.
-    if (this.emitScheduled) return;
-    this.emitScheduled = true;
-    requestAnimationFrame(() => {
-      this.emitScheduled = false;
-      const players = this.list();
-      this.listeners.forEach((l) => l(players));
-      void this.lastEmitReason;
-    });
+    const players = this.list();
+    this.listeners.forEach((l) => l(players));
+    void reason;
   }
 }
 
@@ -239,6 +236,7 @@ export class PresenceSyncService {
   private heartbeat: number | null = null;
   private metricsTimer: number | null = null;
   private watchdog: number | null = null;
+  private periodicResync: number | null = null;
   private reconnectTimer: number | null = null;
   private lastWrite = 0;
   private lastBroadcast = 0;
@@ -324,6 +322,7 @@ export class PresenceSyncService {
     if (this.heartbeat) window.clearInterval(this.heartbeat);
     if (this.metricsTimer) window.clearInterval(this.metricsTimer);
     if (this.watchdog) window.clearInterval(this.watchdog);
+    if (this.periodicResync) window.clearInterval(this.periodicResync);
 
     this.heartbeat = window.setInterval(() => {
       if (this.leaving) return;
@@ -369,6 +368,16 @@ export class PresenceSyncService {
         }
       }
     }, WATCHDOG_MS);
+
+    // Periodic full resync against the DB. This is the primary mechanism
+    // that catches players who disconnected without a clean PLAYER_LEAVE
+    // (closed tab, lost connection, crash) — their stale `last_seen` row
+    // will be excluded from the snapshot and setSnapshot() will remove them
+    // from everyone else's view within one cycle.
+    this.periodicResync = window.setInterval(() => {
+      if (this.leaving) return;
+      void this.resyncAuthoritativeState("periodic");
+    }, PERIODIC_RESYNC_MS);
   }
 
   syncLocal(next: Partial<SharedPlayerState>, force = false) {
@@ -430,13 +439,24 @@ export class PresenceSyncService {
     if (this.heartbeat) window.clearInterval(this.heartbeat);
     if (this.metricsTimer) window.clearInterval(this.metricsTimer);
     if (this.watchdog) window.clearInterval(this.watchdog);
+    if (this.periodicResync) window.clearInterval(this.periodicResync);
     if (this.reconnectTimer) window.clearTimeout(this.reconnectTimer);
     window.removeEventListener("online", this.handleOnline);
     document.removeEventListener("visibilitychange", this.handleVisibility);
-    await this.channel?.send({ type: "broadcast", event: "PLAYER_LEAVE", payload: { userId: this.localPlayer.userId, sentAt: Date.now() } });
-    await this.channel?.untrack();
+
+    // Send the leave broadcast and write the offline DB row in parallel,
+    // then give the realtime socket a brief moment to actually flush the
+    // broadcast to other subscribers before we tear the channel down.
+    // Without this delay, `removeChannel` can close the socket before the
+    // PLAYER_LEAVE message is delivered, leaving remote clients unaware
+    // until their next resync.
     const offlineSeenAt = new Date(Date.now() - ACTIVE_PLAYER_WINDOW_MS - 1_000).toISOString();
-    await this.supabase.from("room_players").upsert(sharedPlayerToRow({ ...this.localPlayer, lastSeen: Date.now() }, offlineSeenAt), { onConflict: "user_id,room_id" });
+    await Promise.all([
+      this.channel?.send({ type: "broadcast", event: "PLAYER_LEAVE", payload: { userId: this.localPlayer.userId, sentAt: Date.now() } }),
+      this.supabase.from("room_players").upsert(sharedPlayerToRow({ ...this.localPlayer, lastSeen: Date.now() }, offlineSeenAt), { onConflict: "user_id,room_id" }),
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await this.channel?.untrack();
     if (this.channel) await this.supabase.removeChannel(this.channel);
     this.channel = null;
     this.subscribed = false;
@@ -714,6 +734,7 @@ type RemoteEntry = {
   focusStatus: PlayerFocusStatus;
   typing: boolean;
   ghostSince: number | null;
+  lastSeenInListMs: number;
 };
 
 export class RemotePlayerManager {
@@ -738,12 +759,20 @@ export class RemotePlayerManager {
     });
 
     for (const [id, entry] of this.others) {
-      if (!activeIds.has(id) && entry.ghostSince === null) {
-        // Guard: only start ghosting if we haven't heard from this player
-        // for at least 2 s.  A single render() call where they're absent
-        // (due to upsert ordering or emit debounce timing) must NOT start
-        // the fade — that's the root cause of the flicker on the affected user.
-        if (now - entry.lastUpdateMs < 2_000) continue;
+      if (activeIds.has(id)) {
+        entry.lastSeenInListMs = now;
+        if (entry.ghostSince !== null) {
+          entry.ghostSince = null;
+          this.scene.tweens.killTweensOf(entry.container);
+          this.scene.tweens.add({ targets: entry.container, alpha: 1, duration: 250 });
+        }
+        continue;
+      }
+      // Player missing from this snapshot. Only start ghosting after they've
+      // been absent for a sustained period (ABSENCE_GRACE_MS) — a single
+      // missed snapshot (e.g. during a resync) should not cause a fade.
+      const missingFor = now - entry.lastSeenInListMs;
+      if (missingFor > ABSENCE_GRACE_MS && entry.ghostSince === null) {
         entry.ghostSince = now;
         this.scene.tweens.add({
           targets: entry.container,
@@ -751,12 +780,6 @@ export class RemotePlayerManager {
           duration: Math.min(GHOST_REMOVAL_DELAY_MS * 0.7, 1200),
           ease: "Power2",
         });
-      } else if (activeIds.has(id) && entry.ghostSince !== null) {
-        entry.ghostSince = null;
-        this.scene.tweens.killTweensOf(entry.container);
-        // Set alpha directly — starting a new tween here races with the
-        // fade-out tween and causes a visible flicker.
-        entry.container.setAlpha(1);
       }
     }
   }
@@ -854,6 +877,7 @@ export class RemotePlayerManager {
         focusStatus: player.focusStatus,
         typing: !!player.typing,
         ghostSince: null,
+        lastSeenInListMs: nowMs,
       };
       this.others.set(player.userId, entry);
       if (player.avatar_url) this.attachAvatar(player.userId, player.avatar_url);
@@ -861,7 +885,7 @@ export class RemotePlayerManager {
       if (entry.ghostSince !== null) {
         entry.ghostSince = null;
         this.scene.tweens.killTweensOf(entry.container);
-        entry.container.setAlpha(1);
+        this.scene.tweens.add({ targets: entry.container, alpha: 1, duration: 250 });
       }
 
       entry.nameText.setText(`${player.username}${player.typing ? " …" : ""}`);
