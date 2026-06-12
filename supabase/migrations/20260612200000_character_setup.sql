@@ -1,12 +1,21 @@
--- Add gender + character_config to profiles (character_config stores shirt/pants/skin/hair hex values)
+-- Add gender + character_config to profiles
 ALTER TABLE public.profiles
   ADD COLUMN IF NOT EXISTS gender TEXT NOT NULL DEFAULT 'male' CHECK (gender IN ('male', 'female')),
   ADD COLUMN IF NOT EXISTS character_config JSONB;
 
--- Add gender to room_players if not already present
+-- Add gender + character_config to room_players
 ALTER TABLE public.room_players
   ADD COLUMN IF NOT EXISTS gender TEXT NOT NULL DEFAULT 'male' CHECK (gender IN ('male', 'female')),
   ADD COLUMN IF NOT EXISTS character_config JSONB;
+
+-- Back-fill room_players from profiles for any existing rows
+UPDATE public.room_players rp
+SET
+  gender        = p.gender,
+  character_config = p.character_config
+FROM public.profiles p
+WHERE rp.user_id = p.id
+  AND (rp.character_config IS NULL OR rp.gender != p.gender);
 
 -- Update handle_new_user to persist gender from OAuth metadata
 CREATE OR REPLACE FUNCTION public.handle_new_user()

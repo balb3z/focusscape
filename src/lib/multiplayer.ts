@@ -622,37 +622,42 @@ export class PresenceSyncService {
 
   private async resyncAuthoritativeState(reason: string) {
     const cutoff = new Date(Date.now() - ACTIVE_PLAYER_WINDOW_MS).toISOString();
-    // Join profiles to get character_config + gender from the authoritative source.
-    // room_players.gender/character_config may lag or be null for older rows.
     const { data, error } = await this.supabase
       .from("room_players")
-      .select("*, profiles!inner(gender, character_config)")
+      .select("*")
       .eq("room_id", this.localPlayer.roomId)
       .gte("last_seen", cutoff);
 
     if (error) {
-      // Fall back to plain select if join fails (e.g. RLS edge case)
-      console.warn(`[mp] resync with join failed (${reason}), falling back:`, error.message);
-      const { data: plain, error: plainErr } = await this.supabase
-        .from("room_players")
-        .select("*")
-        .eq("room_id", this.localPlayer.roomId)
-        .gte("last_seen", cutoff);
-      if (plainErr) {
-        console.error(`[mp] resync failed (${reason})`, plainErr);
-        this.updateMetrics({ consistency: "degraded", lastEvent: "resync failed", lastEventAt: Date.now() });
-        return;
-      }
-      const snapshot = (plain ?? []).map(rowToSharedPlayer).filter((p) => p.userId !== this.localPlayer.userId);
-      snapshot.push(this.localPlayer);
-      this.roomState.setSnapshot(snapshot);
-      this.updateMetrics({ connectedPlayers: this.roomState.count(), roomStateVersion: this.roomState.version(), activeTables: this.roomState.activeTableCount(), lastEvent: `resync:${reason}`, lastEventAt: Date.now() });
+      console.error(`[mp] resync failed (${reason})`, error);
+      this.updateMetrics({ consistency: "degraded", lastEvent: "resync failed", lastEventAt: Date.now() });
       return;
     }
 
-    // Merge profile data into each row before mapping
-    const enriched = (data ?? []).map((row) => {
-      const prof = (row as unknown as { profiles?: { gender?: string; character_config?: CharacterConfig | null } }).profiles;
+    const rows = data ?? [];
+
+    // Fetch character_config + gender from profiles for all players in one query.
+    // We do this separately because room_players has no FK to public.profiles
+    // (it references auth.users), so PostgREST joins don't work here.
+    let profileMap = new Map<string, { gender?: string; character_config?: CharacterConfig | null }>();
+    if (rows.length > 0) {
+      const userIds = rows.map((r) => r.user_id);
+      const { data: profiles } = await this.supabase
+        .from("profiles")
+        .select("id, gender, character_config")
+        .in("id", userIds);
+      if (profiles) {
+        profiles.forEach((p) => {
+          profileMap.set(p.id, {
+            gender: p.gender ?? undefined,
+            character_config: (p.character_config as unknown as CharacterConfig | null) ?? null,
+          });
+        });
+      }
+    }
+
+    const enriched = rows.map((row) => {
+      const prof = profileMap.get(row.user_id);
       return {
         ...row,
         gender: prof?.gender ?? row.gender ?? "male",
